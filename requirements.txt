@@ -1,9 +1,6 @@
 wyoming==1.5.4
 zeroconf==0.88.0
 pyring-buffer==1.0.0
-asyncio
-pathlib
-pyring_buffer
-webrtc
-webrtc-noise-gain==1.2.3
-pysilero-vad==1.0.0
+asyncio==3.4.3
+pathlib==1.0.1
+webrtcvad==2.0.10
