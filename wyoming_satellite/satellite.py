@@ -72,14 +72,14 @@ class SoundEvent:
 
 class SatelliteBase:
     """Base class for satellites."""
-    self.websocket_server = None
+
     def __init__(self, settings: SatelliteSettings) -> None:
         self.settings = settings
         self.server_id: Optional[str] = None
         self._state = State.NOT_STARTED
         self._state_changed = asyncio.Event()
         self._writer: Optional[asyncio.StreamWriter] = None
-
+        self.websocket_server = None
         self._mic_task: Optional[asyncio.Task] = None
         self._mic_webrtc: Optional[Callable[[bytes], bytes]] = None
         self._snd_task: Optional[asyncio.Task] = None
