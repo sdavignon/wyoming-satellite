@@ -72,7 +72,7 @@ class SoundEvent:
 
 class SatelliteBase:
     """Base class for satellites."""
-
+    self.websocket_server = None
     def __init__(self, settings: SatelliteSettings) -> None:
         self.settings = settings
         self.server_id: Optional[str] = None
@@ -95,6 +95,8 @@ class SatelliteBase:
 
         self.microphone_muted = False
         self._unmute_microphone_task: Optional[asyncio.Task] = None
+        
+        self.sentiment_analyzer = SentimentIntensityAnalyzer()
 
         # Debug audio recording
         self.wake_audio_writer: Optional[DebugAudioWriter] = None
@@ -128,6 +130,8 @@ class SatelliteBase:
 
     async def run(self) -> None:
         """Run main satellite loop."""
+        # Start the WebSocket server
+        self.websocket_server = await websockets.serve(self.handle_volume_adjustment, "localhost", 6789)
 
         while self.is_running:
             try:
@@ -353,6 +357,23 @@ class SatelliteBase:
         await self.event_to_server(run_pipeline)
         await self.forward_event(run_pipeline)
 
+    async def handle_volume_adjustment(self, websocket, path):
+        """Handle incoming volume adjustment commands."""
+        async for message in websocket:
+            try:
+                command, value = message.split(':')
+                if command == "adjust-volume":
+                    new_volume = int(value)
+                    self.set_system_volume(new_volume)
+            except Exception as e:
+                _LOGGER.error(f"Error handling volume adjustment: {e}")
+
+    def set_system_volume(self, volume):
+        """Set the system volume using amixer."""
+        subprocess.call(["amixer", "set", "Master", f"{volume}%"])
+        _LOGGER.info(f"Volume set to {volume}%")
+
+    
     async def _restart(self) -> None:
         """Disconnects from services and restarts loop."""
         self.state = State.RESTARTING
@@ -865,11 +886,29 @@ class SatelliteBase:
 
     async def trigger_synthesize(self, synthesize: Synthesize) -> None:
         """Called when text-to-speech text is received."""
-        await run_event_command(self.settings.event.synthesize, synthesize.text)
+        text = synthesize.text
+        sentiment = self.analyze_sentiment(text)
+        await self.notify_frontend(f"sentiment:{sentiment}")
+        await run_event_command(self.settings.event.synthesize, text)
+        
+    def analyze_sentiment(self, text):
+        """Analyze the sentiment of the text."""
+        scores = self.sentiment_analyzer.polarity_scores(text)
+        if scores['compound'] >= 0.05:
+            return 'happy'
+        elif scores['compound'] <= -0.05:
+            return 'sad'
+        else:
+            return 'neutral'
 
-    async def trigger_tts_start(self) -> None:
-        """Called when text-to-speech audio starts."""
-        await run_event_command(self.settings.event.tts_start)
+    async def notify_frontend(self, command):
+        """Send command to the WebSocket client."""
+        uri = "ws://localhost:6790"  # WebSocket server running on your Electron app
+        async with websockets.connect(uri) as websocket:
+            await websocket.send(command)
+        async def trigger_tts_start(self) -> None:
+            """Called when text-to-speech audio starts."""
+            await run_event_command(self.settings.event.tts_start)
 
     async def trigger_tts_stop(self) -> None:
         """Called when text-to-speech audio stops."""
