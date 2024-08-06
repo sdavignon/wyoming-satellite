@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Dict, Final, List, Optional, Set, Union
-
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        
 from pyring_buffer import RingBuffer
 from wyoming.asr import Transcript
 from wyoming.audio import AudioChunk, AudioFormat, AudioStart, AudioStop
@@ -95,7 +96,6 @@ class SatelliteBase:
 
         self.microphone_muted = False
         self._unmute_microphone_task: Optional[asyncio.Task] = None
-        
         self.sentiment_analyzer = SentimentIntensityAnalyzer()
 
         # Debug audio recording
