@@ -1,11 +1,9 @@
-"""Satellite code."""
 import array
 import asyncio
 import logging
 import math
 import time
 import wave
-import subprocess
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -55,7 +53,6 @@ _PONG_TIMEOUT: Final = 5
 _PING_SEND_DELAY: Final = 2
 _WAKE_INFO_TIMEOUT: Final = 2
 
-
 class State(Enum):
     NOT_STARTED = auto()
     STARTING = auto()
@@ -64,12 +61,10 @@ class State(Enum):
     STOPPING = auto()
     STOPPED = auto()
 
-
 @dataclass
 class SoundEvent:
     event: Event
     is_tts: bool
-
 
 class SatelliteBase:
     """Base class for satellites."""
@@ -80,7 +75,7 @@ class SatelliteBase:
         self._state = State.NOT_STARTED
         self._state_changed = asyncio.Event()
         self._writer: Optional[asyncio.StreamWriter] = None
-        self.websocket_server = None
+        self.websocket_sentiment_server = None
         self._mic_task: Optional[asyncio.Task] = None
         self._mic_webrtc: Optional[Callable[[bytes], bytes]] = None
         self._snd_task: Optional[asyncio.Task] = None
@@ -131,7 +126,6 @@ class SatelliteBase:
     async def run(self) -> None:
         """Run main satellite loop."""
         # Start the WebSocket servers
-        self.websocket_volume_server = await websockets.serve(self.handle_volume_adjustment, "localhost", 6789)
         self.websocket_sentiment_server = await websockets.serve(self.handle_sentiment, "localhost", 6790)
 
         while self.is_running:
@@ -256,7 +250,6 @@ class SatelliteBase:
     async def event_from_server(self, event: Event) -> None:
         """Called when an event is received from the server."""
         forward_event = True
-
         if Ping.is_type(event.type):
             # Respond with pong
             ping = Ping.from_event(event)
@@ -304,7 +297,10 @@ class SatelliteBase:
         elif Synthesize.is_type(event.type):
             # TTS request
             _LOGGER.debug(event)
-            await self.trigger_synthesize(Synthesize.from_event(event))
+            synthesize = Synthesize.from_event(event)
+            await self.trigger_synthesize(synthesize)
+            sentiment = self.analyze_sentiment(synthesize.text)
+            await self.notify_frontend(f"sentiment:{sentiment}")
         elif Error.is_type(event.type):
             _LOGGER.warning(event)
             await self.trigger_error(Error.from_event(event))
@@ -357,22 +353,6 @@ class SatelliteBase:
         _LOGGER.debug(run_pipeline)
         await self.event_to_server(run_pipeline)
         await self.forward_event(run_pipeline)
-
-    async def handle_volume_adjustment(self, websocket, path):
-        """Handle incoming volume adjustment commands."""
-        async for message in websocket:
-            try:
-                command, value = message.split(':')
-                if command == "adjust-volume":
-                    new_volume = int(value)
-                    self.set_system_volume(new_volume)
-            except Exception as e:
-                _LOGGER.error(f"Error handling volume adjustment: {e}")
-
-    def set_system_volume(self, volume):
-        """Set the system volume using amixer."""
-        subprocess.call(["amixer", "set", "Master", f"{volume}%"])
-        _LOGGER.info(f"Volume set to {volume}%")
 
     async def handle_sentiment(self, websocket, path):
         """Handle incoming sentiment commands."""
@@ -534,10 +514,8 @@ class AlwaysStreamingSatellite(SatelliteBase):
                 # so the event service can reset LEDs, etc.
                 await self.trigger_streaming_start()
 
-    async def event_from_mic(
-        self, event: Event, audio_bytes: Optional[bytes] = None
-    ) -> None:
-        if (not self.is_streaming) or self.microphone_muted:
+    async def event_from_mic(self, event: Event, audio_bytes: Optional[bytes] = None) -> None:
+        if not self.is_streaming or self.microphone_muted:
             return
 
         if AudioChunk.is_type(event.type):
@@ -546,17 +524,11 @@ class AlwaysStreamingSatellite(SatelliteBase):
 
             # Debug audio recording
             if self.stt_audio_writer is not None:
-                if audioSure, here is the continuation of your `satellite.py` file with the necessary changes to support sending sentiment along with TTS audio:
-
-```python
                 if audio_bytes is None:
                     chunk = AudioChunk.from_event(event)
                     audio_bytes = chunk.audio
 
                 self.stt_audio_writer.write(audio_bytes)
-
-
-# -----------------------------------------------------------------------------
 
 
 class VadStreamingSatellite(SatelliteBase):
@@ -572,8 +544,7 @@ class VadStreamingSatellite(SatelliteBase):
             threshold=settings.vad.threshold, trigger_level=settings.vad.trigger_level
         )
 
-        # Timestamp in the future when we will have timed out (set with
-        # time.monotonic())
+        # Timestamp in the future when we will have timed out (set with time.monotonic())
         self.timeout_seconds: Optional[float] = None
 
         # Audio from right before speech starts (circular buffer)
@@ -614,14 +585,8 @@ class VadStreamingSatellite(SatelliteBase):
             if self.stt_audio_writer is not None:
                 self.stt_audio_writer.stop()
 
-    async def event_from_mic(
-        self, event: Event, audio_bytes: Optional[bytes] = None
-    ) -> None:
-        if (
-            (not AudioChunk.is_type(event.type))
-            or self.microphone_muted
-            or self._is_paused
-        ):
+    async def event_from_mic(self, event: Event, audio_bytes: Optional[bytes] = None) -> None:
+        if not AudioChunk.is_type(event.type) or self.microphone_muted or self._is_paused:
             return
 
         # Only unpack chunk once
@@ -638,8 +603,8 @@ class VadStreamingSatellite(SatelliteBase):
 
         if (
             self.is_streaming
-            and (self.timeout_seconds is not None)
-            and (time.monotonic() >= self.timeout_seconds)
+            and self.timeout_seconds is not None
+            and time.monotonic() >= self.timeout_seconds
         ):
             # Time out during wake word recognition
             self.is_streaming = False
@@ -717,9 +682,6 @@ class VadStreamingSatellite(SatelliteBase):
             self.vad_buffer.put(bytes(self.vad_buffer.maxlen))
 
 
-# -----------------------------------------------------------------------------
-
-
 class WakeStreamingSatellite(SatelliteBase):
     """Satellite that waits for local wake word detection before streaming."""
 
@@ -730,16 +692,14 @@ class WakeStreamingSatellite(SatelliteBase):
         super().__init__(settings)
         self.is_streaming = False
 
-        # Timestamp in the future when the refractory period is over (set with
-        # time.monotonic()).
+        # Timestamp in the future when the refractory period is over (set with time.monotonic())
         # wake word id -> seconds
         self.refractory_timestamp: Dict[Optional[str], float] = {}
 
         if settings.vad.enabled:
             _LOGGER.warning("VAD is enabled but will not be used")
 
-        # Used for debug audio recording so both wake and stt WAV files have the
-        # same timestamp.
+        # Used for debug audio recording so both wake and stt WAV files have the same timestamp.
         self._debug_recording_timestamp: Optional[int] = None
 
         self._is_paused = False
@@ -766,8 +726,7 @@ class WakeStreamingSatellite(SatelliteBase):
             is_error = True
 
         if is_transcript or is_pause_satellite:
-            # Stop streaming before event_from_server is called because it will
-            # play the "done" WAV.
+            # Stop streaming before event_from_server is called because it will play the "done" WAV.
             self.is_streaming = False
 
             # Stop debug recording (stt)
@@ -799,8 +758,8 @@ class WakeStreamingSatellite(SatelliteBase):
                             timestamp=self._debug_recording_timestamp
                         )
 
-    async def trigger_server_disonnected(self) -> None:
-        await super().trigger_server_disonnected()
+    async def trigger_server_disconnected(self) -> None:
+        await super().trigger_server_disconnected()
 
         self.is_streaming = False
 
@@ -810,23 +769,18 @@ class WakeStreamingSatellite(SatelliteBase):
 
         await self.trigger_streaming_stop()
 
-    async def event_from_mic(
-        self, event: Event, audio_bytes: Optional[bytes] = None
-    ) -> None:
-        if (
-            (not AudioChunk.is_type(event.type))
-            or self.microphone_muted
-            or self._is_paused
-        ):
+    async def event_from_mic(self, event: Event, audio_bytes: Optional[bytes] = None) -> None:
+        if not AudioChunk.is_type(event.type) or self.microphone_muted or self._is_paused:
             return
 
         # Debug audio recording
-        if (self.wake_audio_writer is not None) or (self.stt_audio_writer is not None):
+        if self.wake_audio_writer is not None or self.stt_audio_writer is not None:
             if audio_bytes is None:
                 chunk = AudioChunk.from_event(event)
                 audio_bytes = chunk.audio
 
             if self.wake_audio_writer is not None:
+           if self.wake_audio_writer is not None:
                 self.wake_audio_writer.write(audio_bytes)
 
             if self.stt_audio_writer is not None:
@@ -845,21 +799,16 @@ class WakeStreamingSatellite(SatelliteBase):
             self._wake_info_ready.set()
             return
 
-        if self.is_streaming or (self.server_id is None):
+        if self.is_streaming or self.server_id is None:
             # Not detecting or no server connected
             return
 
-        if Detection.is_type(eventHere’s the continuation of the `satellite.py` script with the necessary changes to support sending sentiment along with TTS audio:
-
-```python
         if Detection.is_type(event.type):
             detection = Detection.from_event(event)
 
             # Check refractory period to avoid multiple back-to-back detections
             refractory_timestamp = self.refractory_timestamp.get(detection.name)
-            if (refractory_timestamp is not None) and (
-                refractory_timestamp > time.monotonic()
-            ):
+            if refractory_timestamp is not None and refractory_timestamp > time.monotonic():
                 _LOGGER.debug("Wake word detection occurred during refractory period")
                 return
 
@@ -877,11 +826,8 @@ class WakeStreamingSatellite(SatelliteBase):
             _LOGGER.debug("Streaming audio")
 
             if self.settings.wake.refractory_seconds is not None:
-                # Another detection may not occur for this wake word until
-                # refractory period is over.
-                self.refractory_timestamp[detection.name] = (
-                    time.monotonic() + self.settings.wake.refractory_seconds
-                )
+                # Another detection may not occur for this wake word until refractory period is over.
+                self.refractory_timestamp[detection.name] = time.monotonic() + self.settings.wake.refractory_seconds
             else:
                 # No refractory period
                 self.refractory_timestamp.pop(detection.name, None)
@@ -900,7 +846,7 @@ class WakeStreamingSatellite(SatelliteBase):
 
             await self._send_run_pipeline(pipeline_name=pipeline_name)
             await self.forward_event(event)  # forward to event service
-            await self.trigger_detection(Detection.from_event(event))
+            await self.trigger_detection(detection)
             await self.trigger_streaming_start()
 
     async def update_info(self, info: Info) -> None:
