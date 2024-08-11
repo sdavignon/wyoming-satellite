@@ -169,7 +169,7 @@ class SatelliteBase:
         self._disable_ping()
 
         _LOGGER.debug("Server disconnected")
-        await self.trigger_server_disonnected()
+        await self.trigger_server_disconnected()
 
     async def event_to_server(self, event: Event) -> None:
         """Send an event to the server."""
@@ -354,6 +354,7 @@ class SatelliteBase:
         await self.event_to_server(run_pipeline)
         await self.forward_event(run_pipeline)
 
+
     async def handle_sentiment(self, websocket, path):
         """Handle incoming sentiment commands."""
         async for message in websocket:
@@ -379,6 +380,547 @@ class SatelliteBase:
         uri = "ws://localhost:6790"  # WebSocket server running on your Electron app
         async with websockets.connect(uri) as websocket:
             await websocket.send(command)
+
+    def _process_mic_audio(self, audio_bytes: bytes) -> bytes:
+        """Perform audio pre-processing on mic input."""
+        if self.settings.mic.volume_multiplier != 1.0:
+            audio_bytes = multiply_volume(
+                audio_bytes, self.settings.mic.volume_multiplier
+            )
+
+        if self._mic_webrtc is not None:
+            # Noise suppression and auto gain
+            audio_bytes = self._mic_webrtc(audio_bytes)
+
+        return audio_bytes
+
+    # -------------------------------------------------------------------------
+    # Sound
+    # -------------------------------------------------------------------------
+
+    async def event_to_snd(self, event: Event, is_tts: bool = True) -> None:
+        """Send an event to the sound service."""
+        if self._snd_queue is not None:
+            self._snd_queue.put_nowait(SoundEvent(event, is_tts))
+
+    def _make_snd_client(self) -> Optional[AsyncClient]:
+        """Create client for snd service."""
+        if self.settings.snd.command:
+            program, *program_args = self.settings.snd.command
+            return SndProcessAsyncClient(
+                rate=self.settings.snd.rate,
+                width=self.settings.snd.width,
+                channels=self.settings.snd.channels,
+                program=program,
+                program_args=program_args,
+            )
+
+        if self.settings.snd.uri:
+            return AsyncClient.from_uri(self.settings.snd.uri)
+
+        return None
+
+    async def _snd_task_proc(self) -> None:
+        """Snd service loop."""
+        snd_client: Optional[AsyncClient] = None
+
+        async def _disconnect() -> None:
+            try:
+                if snd_client is not None:
+                    await snd_client.disconnect()
+            except Exception:
+                pass  # ignore disconnect errors
+
+        while self.is_running:
+            try:
+                if self._snd_queue is None:
+                    self._snd_queue = asyncio.Queue()
+
+                snd_event = await self._snd_queue.get()
+                event = snd_event.event
+
+                if snd_client is None:
+                    snd_client = self._make_snd_client()
+                    assert snd_client is not None
+                    await snd_client.connect()
+                    _LOGGER.debug("Connected to snd service")
+
+                # Audio processing
+                if self.settings.snd.needs_processing and AudioChunk.is_type(
+                    event.type
+                ):
+                    chunk = AudioChunk.from_event(event)
+                    audio_bytes = self._process_snd_audio(chunk.audio)
+                    event = AudioChunk(
+                        rate=chunk.rate,
+                        width=chunk.width,
+                        channels=chunk.channels,
+                        audio=audio_bytes,
+                    ).event()
+
+                await snd_client.write_event(event)
+
+                if self.settings.snd.disconnect_after_stop and AudioStop.is_type(
+                    event.type
+                ):
+                    await _disconnect()
+                    if snd_event.is_tts:
+                        await self.trigger_played()
+                    snd_client = None  # reconnect on next event
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                _LOGGER.exception("Unexpected error in snd read task")
+                await _disconnect()
+                snd_client = None  # reconnect
+                self._snd_queue = None
+                await asyncio.sleep(self.settings.snd.reconnect_seconds)
+
+        await _disconnect()
+
+    def _process_snd_audio(self, audio_bytes: bytes) -> bytes:
+        """Perform audio pre-processing on snd output."""
+        if self.settings.snd.volume_multiplier != 1.0:
+            audio_bytes = multiply_volume(
+                audio_bytes, self.settings.snd.volume_multiplier
+            )
+
+        return audio_bytes
+
+    async def _play_wav(
+        self, wav_path: Optional[Union[str, Path]], mute_microphone: bool = False
+    ) -> None:
+        """Send WAV as events to sound service."""
+        if (not wav_path) or (not self.settings.snd.enabled):
+            return
+
+        try:
+            if mute_microphone:
+                with wave.open(str(wav_path), "rb") as wav_file:
+                    seconds_to_mute = wav_file.getnframes() / wav_file.getframerate()
+
+                seconds_to_mute += self.settings.mic.seconds_to_mute_after_awake_wav
+                _LOGGER.debug("Muting microphone for %s second(s)", seconds_to_mute)
+                self.microphone_muted = True
+                self._unmute_microphone_task = asyncio.create_task(
+                    self._unmute_microphone_after(seconds_to_mute)
+                )
+
+            for event in wav_to_events(
+                wav_path,
+                samples_per_chunk=self.settings.snd.samples_per_chunk,
+            ):
+                await self.event_to_snd(event, is_tts=False)
+        except Exception:
+            # Unmute in case of an error
+            self.microphone_muted = False
+
+            raise
+
+    async def _unmute_microphone_after(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+        self.microphone_muted = False
+        _LOGGER.debug("Unmuted microphone")
+
+    def _process_mic_audio(self, audio_bytes: bytes) -> bytes:
+        """Perform audio pre-processing on mic input."""
+        if self.settings.mic.volume_multiplier != 1.0:
+            audio_bytes = multiply_volume(
+                audio_bytes, self.settings.mic.volume_multiplier
+            )
+
+        if self._mic_webrtc is not None:
+            # Noise suppression and auto gain
+            audio_bytes = self._mic_webrtc(audio_bytes)
+
+        return audio_bytes
+
+    # -------------------------------------------------------------------------
+    # Wake
+    # -------------------------------------------------------------------------
+
+    async def event_from_wake(self, event: Event) -> None:
+        """Called when an event is received from the wake service."""
+
+    async def event_to_wake(self, event: Event) -> None:
+        """Send event to the wake service."""
+        if self._wake_queue is not None:
+            self._wake_queue.put_nowait(event)
+
+    def _make_wake_client(self) -> Optional[AsyncClient]:
+        """Create client for wake service."""
+        if self.settings.wake.command:
+            program, *program_args = self.settings.wake.command
+            return WakeProcessAsyncClient(
+                rate=self.settings.wake.rate,
+                width=self.settings.wake.width,
+                channels=self.settings.wake.channels,
+                program=program,
+                program_args=program_args,
+            )
+
+        if self.settings.wake.uri:
+            return AsyncClient.from_uri(self.settings.wake.uri)
+
+        return None
+
+    async def _wake_task_proc(self) -> None:
+        """Wake service loop."""
+        wake_client: Optional[AsyncClient] = None
+        to_client_task: Optional[asyncio.Task] = None
+        from_client_task: Optional[asyncio.Task] = None
+        pending: Set[asyncio.Task] = set()
+
+        async def _disconnect() -> None:
+            nonlocal to_client_task, from_client_task
+            try:
+                if wake_client is not None:
+                    await wake_client.disconnect()
+
+                # Clean up tasks
+                if to_client_task is not None:
+                    to_client_task.cancel()
+                    to_client_task = None
+
+                if from_client_task is not None:
+                    from_client_task.cancel()
+                    from_client_task = None
+            except Exception:
+                pass  # ignore disconnect errors
+
+        while self.is_running:
+            try:
+                if self._wake_queue is None:
+                    self._wake_queue = asyncio.Queue()
+
+                if wake_client is None:
+                    wake_client = self._make_wake_client()
+                    assert wake_client is not None
+                    await wake_client.connect()
+                    _LOGGER.debug("Connected to wake service")
+
+                    # Reset
+                    from_client_task = None
+                    to_client_task = None
+                    pending = set()
+                    self._wake_queue = asyncio.Queue()
+
+                    # Inform wake service of which wake word(s) to detect
+                    await self._send_wake_detect()
+
+                # Read/write in "parallel"
+                if to_client_task is None:
+                    # From satellite to wake service
+                    to_client_task = asyncio.create_task(
+                        self._wake_queue.get(), name="wake_to_client"
+                    )
+                    pending.add(to_client_task)
+
+                if from_client_task is None:
+                    # From wake service to satellite
+                    from_client_task = asyncio.create_task(
+                        wake_client.read_event(), name="wake_from_client"
+                    )
+                    pending.add(from_client_task)
+
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if to_client_task in done:
+                    # Event to go to wake service (audio)
+                    assert to_client_task is not None
+                    event = to_client_task.result()
+                    to_client_task = None
+                    await wake_client.write_event(event)
+
+                if from_client_task in done:
+                    # Event from wake service (detection)
+                    assert from_client_task is not None
+                    event = from_client_task.result()
+                    from_client_task = None
+
+                    if event is None:
+                        _LOGGER.warning("Wake service disconnected")
+                        await _disconnect()
+                        wake_client = None  # reconnect
+                        await asyncio.sleep(self.settings.wake.reconnect_seconds)
+                        continue
+
+                    await self.event_from_wake(event)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                _LOGGER.exception("Unexpected error in wake read task")
+                await _disconnect()
+                wake_client = None  # reconnect
+                await asyncio.sleep(self.settings.wake.reconnect_seconds)
+
+        await _disconnect()
+
+    async def _send_wake_detect(self) -> None:
+        """Inform wake word service of which wake words to detect."""
+        wake_names: Optional[List[str]] = None
+        if self.settings.wake.names:
+            wake_names = [w.name for w in self.settings.wake.names]
+
+        await self.event_to_wake(Detect(names=wake_names).event())
+        await self.trigger_detect()
+
+    # -------------------------------------------------------------------------
+    # Events
+    # -------------------------------------------------------------------------
+
+    async def trigger_server_connected(self) -> None:
+        """Called when connected to server."""
+        _LOGGER.info("Connected to server")
+        await run_event_command(self.settings.event.connected)
+        await self.forward_event(SatelliteConnected().event())
+
+    async def trigger_server_disconnected(self) -> None:
+        """Called when disconnected from server."""
+        _LOGGER.info("Disconnected from server")
+        await run_event_command(self.settings.event.disconnected)
+        await self.forward_event(SatelliteDisconnected().event())
+
+    async def trigger_streaming_start(self) -> None:
+        """Called when audio streaming starts."""
+        await run_event_command(self.settings.event.streaming_start)
+        await self.forward_event(StreamingStarted().event())
+
+    async def trigger_streaming_stop(self) -> None:
+        """Called when audio streaming stops."""
+        await run_event_command(self.settings.event.streaming_stop)
+        await self.forward_event(StreamingStopped().event())
+
+    async def trigger_detect(self) -> None:
+        """Called when wake word detection starts."""
+        await run_event_command(self.settings.event.detect)
+
+    async def trigger_detection(self, detection: Detection) -> None:
+        """Called when wake word is detected."""
+        await run_event_command(self.settings.event.detection, detection.name)
+        await self._play_wav(
+            self.settings.snd.awake_wav,
+            mute_microphone=self.settings.mic.mute_during_awake_wav,
+        )
+
+    async def trigger_played(self) -> None:
+        """Called when audio stopped playing"""
+        await run_event_command(self.settings.event.played)
+        await self.forward_event(Played().event())
+
+    async def trigger_transcript(self, transcript: Transcript) -> None:
+        """Called when speech-to-text text is received."""
+        await run_event_command(self.settings.event.transcript, transcript.text)
+        await self._play_wav(self.settings.snd.done_wav)
+
+    async def trigger_stt_start(self) -> None:
+        """Called when user starts speaking."""
+        await run_event_command(self.settings.event.stt_start)
+
+    async def trigger_stt_stop(self) -> None:
+        """Called when user stops speaking."""
+        await run_event_command(self.settings.event.stt_stop)
+
+    async def trigger_synthesize(self, synthesize: Synthesize) -> None:
+        """Called when text-to-speech text is received."""
+        await run_event_command(self.settings.event.synthesize, synthesize.text)
+
+    # -------------------------------------------------------------------------
+    # Wake
+    # -------------------------------------------------------------------------
+
+    async def event_from_wake(self, event: Event) -> None:
+        """Called when an event is received from the wake service."""
+
+    async def event_to_wake(self, event: Event) -> None:
+        """Send event to the wake service."""
+        if self._wake_queue is not None:
+            self._wake_queue.put_nowait(event)
+
+    def _make_wake_client(self) -> Optional[AsyncClient]:
+        """Create client for wake service."""
+        if self.settings.wake.command:
+            program, *program_args = self.settings.wake.command
+            return WakeProcessAsyncClient(
+                rate=self.settings.wake.rate,
+                width=self.settings.wake.width,
+                channels=self.settings.wake.channels,
+                program=program,
+                program_args=program_args,
+            )
+
+        if self.settings.wake.uri:
+            return AsyncClient.from_uri(self.settings.wake.uri)
+
+        return None
+
+    async def _wake_task_proc(self) -> None:
+        """Wake service loop."""
+        wake_client: Optional[AsyncClient] = None
+        to_client_task: Optional[asyncio.Task] = None
+        from_client_task: Optional[asyncio.Task] = None
+        pending: Set[asyncio.Task] = set()
+
+        async def _disconnect() -> None:
+            nonlocal to_client_task, from_client_task
+            try:
+                if wake_client is not None:
+                    await wake_client.disconnect()
+
+                # Clean up tasks
+                if to_client_task is not None:
+                    to_client_task.cancel()
+                    to_client_task = None
+
+                if from_client_task is not None:
+                    from_client_task.cancel()
+                    from_client_task = None
+            except Exception:
+                pass  # ignore disconnect errors
+
+        while self.is_running:
+            try:
+                if self._wake_queue is None:
+                    self._wake_queue = asyncio.Queue()
+
+                if wake_client is None:
+                    wake_client = self._make_wake_client()
+                    assert wake_client is not None
+                    await wake_client.connect()
+                    _LOGGER.debug("Connected to wake service")
+
+                    # Reset
+                    from_client_task = None
+                    to_client_task = None
+                    pending = set()
+                    self._wake_queue = asyncio.Queue()
+
+                    # Inform wake service of which wake word(s) to detect
+                    await self._send_wake_detect()
+
+                # Read/write in "parallel"
+                if to_client_task is None:
+                    # From satellite to wake service
+                    to_client_task = asyncio.create_task(
+                        self._wake_queue.get(), name="wake_to_client"
+                    )
+                    pending.add(to_client_task)
+
+                if from_client_task is None:
+                    # From wake service to satellite
+                    from_client_task = asyncio.create_task(
+                        wake_client.read_event(), name="wake_from_client"
+                    )
+                    pending.add(from_client_task)
+
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if to_client_task in done:
+                    # Event to go to wake service (audio)
+                    assert to_client_task is not None
+                    event = to_client_task.result()
+                    to_client_task = None
+                    await wake_client.write_event(event)
+
+                if from_client_task in done:
+                    # Event from wake service (detection)
+                    assert from_client_task is not None
+                    event = from_client_task.result()
+                    from_client_task = None
+
+                    if event is None:
+                        _LOGGER.warning("Wake service disconnected")
+                        await _disconnect()
+                        wake_client = None  # reconnect
+                        await asyncio.sleep(self.settings.wake.reconnect_seconds)
+                        continue
+
+                    await self.event_from_wake(event)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                _LOGGER.exception("Unexpected error in wake read task")
+                await _disconnect()
+                wake_client = None  # reconnect
+                await asyncio.sleep(self.settings.wake.reconnect_seconds)
+
+        await _disconnect()
+
+    async def _send_wake_detect(self) -> None:
+        """Inform wake word service of which wake words to detect."""
+        wake_names: Optional[List[str]] = None
+        if self.settings.wake.names:
+            wake_names = [w.name for w in self.settings.wake.names]
+
+        await self.event_to_wake(Detect(names=wake_names).event())
+        await self.trigger_detect()
+
+    # -------------------------------------------------------------------------
+    # Events
+    # -------------------------------------------------------------------------
+
+    async def trigger_server_connected(self) -> None:
+        """Called when connected to server."""
+        _LOGGER.info("Connected to server")
+        await run_event_command(self.settings.event.connected)
+        await self.forward_event(SatelliteConnected().event())
+
+    async def trigger_server_disconnected(self) -> None:
+        """Called when disconnected from server."""
+        _LOGGER.info("Disconnected from server")
+        await run_event_command(self.settings.event.disconnected)
+        await self.forward_event(SatelliteDisconnected().event())
+
+    async def trigger_streaming_start(self) -> None:
+        """Called when audio streaming starts."""
+        await run_event_command(self.settings.event.streaming_start)
+        await self.forward_event(StreamingStarted().event())
+
+    async def trigger_streaming_stop(self) -> None:
+        """Called when audio streaming stops."""
+        await run_event_command(self.settings.event.streaming_stop)
+        await self.forward_event(StreamingStopped().event())
+
+    async def trigger_detect(self) -> None:
+        """Called when wake word detection starts."""
+        await run_event_command(self.settings.event.detect)
+
+    async def trigger_detection(self, detection: Detection) -> None:
+        """Called when wake word is detected."""
+        await run_event_command(self.settings.event.detection, detection.name)
+        await self._play_wav(
+            self.settings.snd.awake_wav,
+            mute_microphone=self.settings.mic.mute_during_awake_wav,
+        )
+
+    async def trigger_played(self) -> None:
+        """Called when audio stopped playing"""
+        await run_event_command(self.settings.event.played)
+        await self.forward_event(Played().event())
+
+    async def trigger_transcript(self, transcript: Transcript) -> None:
+        """Called when speech-to-text text is received."""
+        await run_event_command(self.settings.event.transcript, transcript.text)
+        await self._play_wav(self.settings.snd.done_wav)
+
+    async def trigger_stt_start(self) -> None:
+        """Called when user starts speaking."""
+        await run_event_command(self.settings.event.stt_start)
+
+    async def trigger_stt_stop(self) -> None:
+        """Called when user stops speaking."""
+        await run_event_command(self.settings.event.stt_stop)
+
+    async def trigger_synthesize(self, synthesize: Synthesize) -> None:
+        """Called when text-to-speech text is received."""
+        await run_event_command(self.settings.event.synthesize, synthesize.text)
+
 
     async def trigger_tts_start(self) -> None:
         """Called when text-to-speech audio starts."""
@@ -780,11 +1322,7 @@ class WakeStreamingSatellite(SatelliteBase):
                 audio_bytes = chunk.audio
 
             if self.wake_audio_writer is not None:
-           if self.wake_audio_writer is not None:
                 self.wake_audio_writer.write(audio_bytes)
-
-            if self.stt_audio_writer is not None:
-                self.stt_audio_writer.write(audio_bytes)
 
         if self.is_streaming:
             # Forward to server
